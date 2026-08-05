@@ -8,6 +8,11 @@
   <a href="https://badge.fury.io/js/%40elastic%2Frequest-crypto"><img src="https://badge.fury.io/js/%40elastic%2Frequest-crypto.svg" alt="npm version" height="18"></a>
 </p>
 
+> **Note (v3):** This package is now **ESM-only** and requires **Node.js ≥ 20.12.0**. CJS
+> consumers must switch to `await import('@elastic/request-crypto')`. The JWE wire format is
+> identical to v2 (RSA-OAEP + A128CBC-HS256 + `zip:DEF`), so encrypted tokens produced by
+> either version can be decrypted by the other.
+
 ### High level overview
 
 There are 3 parts involved for JWK encryption:

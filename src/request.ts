@@ -1,9 +1,13 @@
-import makeAESCryptoWith, { EncryptOutput } from '@elastic/node-crypto';
-import { util } from 'node-jose';
+import _makeAESCryptoWith, { Crypto, CryptoOptions, EncryptOutput } from '@elastic/node-crypto';
 
-import { createJWKManager } from './jwk';
-import { JWKDecryptResult, PrivateJWKS, PublicJWK, PublicJWKS } from './jwks';
-import { generatePassphrase } from './random-bytes';
+import { createJWKManager } from './jwk.js';
+import { JWKDecryptResult, PrivateJWKS, PublicJWK, PublicJWKS } from './jwks.js';
+import { generatePassphrase } from './random-bytes.js';
+
+// @elastic/node-crypto is a CJS module. Under Node.js ESM, importing a CJS default always
+// yields the full exports object, not just the .default property. Unwrap it explicitly.
+const makeAESCryptoWith: (opts: CryptoOptions) => Crypto =
+  (_makeAESCryptoWith as any).default || _makeAESCryptoWith;
 
 export interface Encryptor {
   encrypt(kid: string, input: any): Promise<string>;
@@ -59,11 +63,11 @@ export function packBody(encryptedAESKey: string, encryptedPayload: string): str
     encryptedAESKey,
     encryptedPayload,
   });
-  return util.base64url.encode(packedBodyStringifiedJSON, 'utf8');
+  return Buffer.from(packedBodyStringifiedJSON, 'utf8').toString('base64url');
 }
 
 export function unpackBody(packedBody: string) {
-  const decodedBody = (util.base64url.decode(packedBody) as unknown) as Buffer;
+  const decodedBody = Buffer.from(packedBody, 'base64url');
   const { encryptedAESKey, encryptedPayload } = JSON.parse(decodedBody.toString('utf8'));
   return { encryptedAESKey, encryptedPayload };
 }
