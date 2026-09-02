@@ -1,3 +1,5 @@
+import { calculateJwkThumbprint } from 'jose';
+
 import { createJWKManager } from '../src/jwk';
 
 import { privateJWKS } from './fixture/private_jwks';
@@ -26,6 +28,51 @@ describe('JSON Web Keys Manager', () => {
       await manager.addKey('KIBANA_2');
       const { keys } = manager.getPrivateJWKS();
       expect(keys).to.have.length(1);
+    });
+  });
+
+  describe('Generated keys', () => {
+    it('stamps the RSA-OAEP-256 key wrap algorithm on new keys', async () => {
+      const manager = await createJWKManager();
+      await manager.addKey('KIBANA_NEW');
+
+      expect(manager.getPublicJWK('KIBANA_NEW')!.alg).to.equal('RSA-OAEP-256');
+      expect(manager.getPrivateJWK('KIBANA_NEW')!.alg).to.equal('RSA-OAEP-256');
+    });
+
+    it('derives an RFC 7638 thumbprint kid when none is supplied', async () => {
+      const manager = await createJWKManager();
+      await manager.addKey();
+
+      const [key] = manager.getPublicJWKS().keys;
+      expect(key.kid).to.equal(
+        await calculateJwkThumbprint(key as Parameters<typeof calculateJwkThumbprint>[0])
+      );
+    });
+
+    it('keeps unnamed keys distinct instead of collapsing them onto one entry', async () => {
+      const manager = await createJWKManager();
+      await manager.addKey();
+      await manager.addKey();
+
+      const { keys } = manager.getPrivateJWKS();
+      expect(keys).to.have.length(2);
+      expect(keys[0].kid).to.not.equal(keys[1].kid);
+      // Both must be individually addressable — an empty-string kid would shadow the second key.
+      expect(manager.getPrivateJWK(keys[0].kid)!.n).to.equal(keys[0].n);
+      expect(manager.getPrivateJWK(keys[1].kid)!.n).to.equal(keys[1].n);
+    });
+
+    it('encrypts and decrypts using a generated kid', async () => {
+      const manager = await createJWKManager();
+      await manager.addKey();
+      const { kid } = manager.getPublicJWKS().keys[0];
+      const message = JSON.stringify({ generated: true });
+
+      const token = await manager.encrypt(kid, Buffer.from(message, 'utf8'));
+      const { payload } = await manager.decrypt(token);
+
+      expect(payload.toString('utf8')).to.equal(message);
     });
   });
 
@@ -61,7 +108,7 @@ describe('JSON Web Keys Manager', () => {
       expect(jwkDecryptResult.header).to.eql({
         zip: 'DEF',
         enc: 'A128CBC-HS256',
-        alg: 'RSA-OAEP',
+        alg: 'RSA-OAEP-256',
         kid: 'KIBANA',
       });
       expect(jwkDecryptResult.protected).to.eql(['zip', 'enc', 'alg', 'kid']);

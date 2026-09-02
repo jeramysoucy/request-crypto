@@ -87,7 +87,11 @@ describe('Migration compatibility — node-jose v2 → jose v6', () => {
       const header = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString('utf8'));
       expect(header.zip).to.equal('DEF');
       expect(header.enc).to.equal('A128CBC-HS256');
-      expect(header.alg).to.equal('RSA-OAEP');
+      // Key wrap is the one deliberate wire change: RSA-OAEP (SHA-1) → RSA-OAEP-256, for FIPS
+      // 140-3. node-jose can decrypt this too, as long as the receiving key is not pinned to
+      // RSA-OAEP by its JWK "alg" member — see key-wrap.spec.ts and
+      // docs/rsa-oaep-256-migration.md.
+      expect(header.alg).to.equal('RSA-OAEP-256');
       expect(header.kid).to.equal('KIBANA');
     });
   });
@@ -110,6 +114,18 @@ describe('Migration compatibility — node-jose v2 → jose v6', () => {
       expect(store.get('KIBANA')).to.not.equal(undefined);
       store.remove(privateJWKS.keys[0]);
       expect(store.get('KIBANA')).to.equal(undefined);
+    });
+    it('rejects a malformed JWK at load time rather than on first use', async () => {
+      // Missing the modulus. The exact message comes from the platform's WebCrypto, so only the
+      // fail-fast behaviour is asserted.
+      const malformed = { kty: 'RSA', kid: 'BROKEN', use: 'enc', alg: 'RSA-OAEP', e: 'AQAB' };
+      let threw = false;
+      try {
+        await createJWKS({ keys: [malformed as any] });
+      } catch (err) {
+        threw = true;
+      }
+      expect(threw).to.equal(true);
     });
   });
 });

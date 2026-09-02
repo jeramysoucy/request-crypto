@@ -1,0 +1,281 @@
+# Migrating the key wrap algorithm to RSA-OAEP-256
+
+Status: proposed, tracked by [#56](https://github.com/elastic/request-crypto/pull/56).
+Sender: Kibana (`telemetry_collection_manager`). Receiver: the telemetry service, owned by
+@elastic/platform-analytics.
+
+This document covers the *key wrap* migration only. Everything else about the token — content
+encryption, compression, serialization, the packed body — is unchanged.
+
+## What changes
+
+| Parameter | Before | After |
+|---|---|---|
+| Key wrap (`alg`) | `RSA-OAEP` — RSAES-OAEP, SHA-1 + MGF1-SHA-1 | **encrypt:** `RSA-OAEP-256` only.<br>**decrypt:** `RSA-OAEP-256` *or* `RSA-OAEP`, chosen per token |
+| Content encryption (`enc`) | `A128CBC-HS256` | unchanged, now pinned on decrypt |
+| Compression (`zip`) | `DEF` (raw DEFLATE) | unchanged, now with an explicit 250 KB inflate ceiling |
+| Serialization | JWE compact, header `{zip, enc, alg, kid}` | unchanged |
+| JWK `alg` on newly generated keys | `RSA-OAEP` | `RSA-OAEP-256` |
+
+`RSA-OAEP` is RSAES-OAEP with SHA-1 and MGF1-SHA-1, which is not FIPS 140-3 approved. `RSA-OAEP-256`
+is the same scheme with SHA-256 and MGF1-SHA-256.
+
+Note that the JWK `alg` member no longer decides anything at runtime: keys are imported for whichever
+algorithm is needed, so the public keys Kibana already ships — all stamped `alg: "RSA-OAEP"` — wrap
+with `RSA-OAEP-256` without being rotated or re-published.
+
+## Compatibility matrix
+
+| Sender | Receiver | Result |
+|---|---|---|
+| request-crypto ≤2.x (`RSA-OAEP`) | ≤2.x | works — today's production path |
+| request-crypto ≤2.x (`RSA-OAEP`) | ≥3.x | **works** — receiver reads `alg` from the header and uses the SHA-1 binding |
+| request-crypto ≥3.x (`RSA-OAEP-256`) | ≥3.x | works |
+| request-crypto ≥3.x (`RSA-OAEP-256`) | **≤2.x** | **fails** — see below |
+
+The last row is the constraint the whole rollout order hangs on, and it was verified against real
+node-jose 2.2.0, not assumed. node-jose intersects a key's usable algorithms with the JWK's own
+`alg` member (`JWK.Key#algorithms()` in `cisco/node-jose lib/jwk/basekey.js`), and its keystore then
+only offers keys that support the token's algorithm:
+
+```
+jwk alg on the stored key: RSA-OAEP | algorithms("unwrap"): [ 'RSA-OAEP' ]
+2.x receiver + RSA-OAEP-256 token -> Error: no key found
+```
+
+Because every private JWK in production is stamped `alg: "RSA-OAEP"`, a 2.x receiver rejects an
+`RSA-OAEP-256` token outright — and it surfaces as `no key found`, which reads like a key
+configuration problem rather than an algorithm mismatch. **Receivers must be upgraded and deployed
+before any sender starts emitting `RSA-OAEP-256`.**
+
+## Rollout
+
+Each phase has an exit gate. Do not start a phase before the previous gate is green.
+
+### P0 — publish
+
+Release request-crypto v3 with this change. No traffic is affected: publishing does not upgrade
+anybody.
+
+*Gate:* package published; `npm test` green in CI.
+
+### P1 — receiver upgrades (decrypt-capable, no traffic change)
+
+The telemetry service bumps to v3. All inbound traffic is still `RSA-OAEP`, and stays working: the
+receiver now accepts both algorithms and picks per token. While upgrading, wire the `onKeyWrap` hook
+to a counter — this is the instrument the rest of the rollout is steered by:
+
+```ts
+const decryptor = await createRequestDecryptor(privateJWKS, {
+  onKeyWrap: ({ alg, kid, legacy }) => {
+    metrics.increment('telemetry.request_crypto.key_wrap', { alg, kid, legacy: String(legacy) });
+  },
+});
+```
+
+*Gate:* deployed to staging then production; decrypt error rate flat; the counter reports ~100%
+`RSA-OAEP` and zero `RSA-OAEP-256`.
+
+### P2 — soak the receiver
+
+Leave the receiver on v3 with legacy-only traffic for at least one full release/reporting cycle
+(suggest ≥1 week, covering a weekly telemetry peak).
+
+*Gate:* no increase in decrypt failures, `no key found`, or `ERR_JOSE_ALG_NOT_ALLOWED`; no latency
+regression on the decrypt path.
+
+### P3 — sender switches
+
+Kibana bumps to v3 and begins emitting `RSA-OAEP-256`. Traffic is now mixed, and stays mixed for a
+long time: every Kibana version already in the field keeps sending `RSA-OAEP`, and self-managed
+clusters upgrade on their own schedule.
+
+*Gate:* the counter shows a non-zero and rising `RSA-OAEP-256` share with no corresponding rise in
+decrypt failures. Verify with a dev Kibana build against `kibana_dev1` before the production key.
+
+### P4 — drain
+
+Watch the legacy share decay as older Kibana versions age out. This is bounded by Kibana version
+EOL, so expect a multi-year tail — that is expected and costs nothing, since accepting both
+algorithms is not a security regression for the new one.
+
+*Gate:* `RSA-OAEP` share at zero for an agreed window (suggest ≥1 release cycle past the EOL of the
+last Kibana version that shipped a pre-v3 request-crypto).
+
+### P5 — drop legacy
+
+Remove `LEGACY_KEY_WRAP_ALGORITHM` from `SUPPORTED_KEY_WRAP_ALGORITHMS` in `src/jwks.ts` — a
+one-line change, deliberately isolated there — and release it as a major. Only after this is the
+receiver free of SHA-1 on this path, which is also the precondition for running it under a FIPS-only
+crypto provider (see below).
+
+*Gate:* P4 gate held for the agreed window; @elastic/platform-analytics sign-off.
+
+## Local validation
+
+The automated suite covers the matrix above:
+
+```bash
+npm run lint          # tslint + prettier
+npm test              # mocha via tsx
+npm run test:coverage # c8
+npm run build         # tsc
+```
+
+What proves what:
+
+| Spec | Proves |
+|---|---|
+| `test/key-wrap.spec.ts` → *encryption side* | encrypt emits `RSA-OAEP-256` even from a JWK stamped `alg: "RSA-OAEP"` (the production shape) |
+| `test/key-wrap.spec.ts` → *decryption side* | frozen node-jose vectors for **both** algorithms decrypt; an end-to-end legacy sender simulation decrypts; both algorithms interleaved and concurrent on one manager |
+| `test/key-wrap.spec.ts` → *pinned algorithms* | an out-of-allowlist `alg`/`enc` is rejected; a compression bomb is rejected at the inflate ceiling |
+| `test/key-wrap.spec.ts` → *onKeyWrap* | the rollout metric reports the right algorithm and cannot break a request |
+| `test/compat.spec.ts` | the rest of the wire format is still byte-identical to node-jose output |
+
+### Regenerating the frozen vectors
+
+The frozen `RSA-OAEP-256` vector in `test/key-wrap.spec.ts` was produced with real node-jose so that
+it proves cross-library compatibility. To regenerate (outside the repo, node-jose is not a
+dependency):
+
+```bash
+npm init -y && npm install node-jose@2.2.0
+# fixtures.json = { privateJWKS, publicJWKS } dumped from test/fixture/*.ts
+node -e '
+const jose = require("node-jose");
+const { publicJWKS } = require("./fixtures.json");
+(async () => {
+  // node-jose pins a key to its JWK "alg", so import without it to wrap with SHA-256.
+  const { alg, ...pub } = publicJWKS.keys[0];
+  const key = await jose.JWK.asKey(pub);
+  console.log(await jose.JWE.createEncrypt(
+    { format: "compact", zip: true, fields: { alg: "RSA-OAEP-256" } }, key
+  ).update(Buffer.from("<plaintext>", "utf8")).final());
+})();'
+```
+
+### Driving the full matrix by hand
+
+The unit tests simulate a 2.x sender with jose. To exercise the matrix against *real* node-jose
+bodies — including the failure that dictates the phase order — build two throwaway scripts outside
+the repo, in a directory with `node-jose@2.2.0`, `@elastic/node-crypto@1.2.3`, and a `fixtures.json`
+holding `{ privateJWKS, publicJWKS }` dumped from `test/fixture/*.ts`.
+
+**A 2.x sender** (`old-sender.cjs`) — AES-encrypt the payload, wrap the passphrase with the legacy
+key wrap, pack both:
+
+```js
+const jose = require('node-jose');
+const crypto = require('crypto');
+// node-crypto is CJS-with-default; unwrap it or you get "nodeCrypto is not a function".
+const nodeCrypto = require('@elastic/node-crypto').default || require('@elastic/node-crypto');
+const { publicJWKS } = require('./fixtures.json');
+
+(async () => {
+  const payload = { cluster: 'abc', metrics: [1, 2, 3] };
+  const passphrase = crypto.randomBytes(32);
+  const encryptedPayload = await nodeCrypto({ encryptionKey: passphrase }).encrypt(payload);
+  const key = await jose.JWK.asKey(publicJWKS.keys[0]);
+  const encryptedAESKey = await jose.JWE.createEncrypt({ format: 'compact', zip: true }, key)
+    .update(passphrase)
+    .final();
+  const body = jose.util.base64url.encode(
+    JSON.stringify({ encryptedAESKey, encryptedPayload }), 'utf8'
+  );
+  console.log(JSON.stringify({ body, payload }));
+})();
+```
+
+**A 2.x receiver** (`old-receiver.cjs`) — a node-jose keystore built from the production-shaped
+private JWKS, i.e. keys stamped `alg: "RSA-OAEP"`:
+
+```js
+const jose = require('node-jose');
+const { privateJWKS } = require('./fixtures.json');
+
+(async () => {
+  const ks = await jose.JWK.asKeyStore(privateJWKS);
+  const key = ks.get(privateJWKS.keys[0].kid);
+  console.log('algorithms("unwrap"):', key.algorithms('unwrap'));  // [ 'RSA-OAEP' ]
+  try {
+    await jose.JWE.createDecrypt(ks).decrypt('<encryptedAESKey from a v3 sender>');
+  } catch (e) {
+    console.log('expected failure:', e.message);                   // no key found
+  }
+})();
+```
+
+Feed the bodies across the four combinations. Verified outcomes:
+
+| Case | Result |
+|---|---|
+| 0. 2.x sender → 2.x receiver | `OK (passphrase bytes: 32)` — today's baseline |
+| 1. v3 sender → v3 receiver | `OK`, `onKeyWrap` reports `{ alg: 'RSA-OAEP-256', legacy: false }` |
+| 2. 2.x sender → v3 receiver | `OK`, `onKeyWrap` reports `{ alg: 'RSA-OAEP', legacy: true }` |
+| 3. v3 sender → 2.x receiver | `FAILS: no key found` |
+
+## Cloud / staging validation
+
+1. **Replay legacy traffic.** Deploy the v3 receiver to staging and replay captured `RSA-OAEP`
+   bodies. Every one must decrypt, and the `onKeyWrap` counter must report `legacy: true`.
+2. **Drive the new algorithm from a real sender.** Point a dev Kibana build (v3 dependency) at
+   staging using `kibana_dev1`. Confirm the telemetry documents land and the counter reports both
+   algorithms side by side.
+3. **Watch the failure modes explicitly.** Alert on decrypt failure rate, `no key found`, and
+   `ERR_JOSE_ALG_NOT_ALLOWED`. The first is what a premature sender switch would look like on an
+   un-upgraded receiver; the last is what a genuinely unexpected algorithm looks like.
+4. **Production canary.** Because senders roll out per Kibana release, P3 is inherently canaried —
+   the first upgraded clusters are a small share of traffic. Do not accelerate it with a forced
+   upgrade until the mixed-traffic gate has held.
+5. **Key rotation is not required.** Existing keys keep working. If a key *is* rotated with v3, the
+   new JWK is stamped `alg: "RSA-OAEP-256"`; a pre-v3 sender reading that JWK would then wrap with
+   SHA-256, which only a v3 receiver can read. Do not publish a v3-generated key to senders until
+   P1 is complete.
+
+## FIPS mode: verify before enabling
+
+Accepting `RSA-OAEP` means the receiver still performs SHA-1 OAEP whenever a legacy token arrives. A
+FIPS-only crypto provider may refuse that operation outright, in which case **enabling FIPS mode on
+the receiver before P4 would break legacy senders**.
+
+This could not be settled locally: a stock Node build has no loadable FIPS provider
+(`node --enable-fips` fails to `dlopen` `fips.dylib`, and `crypto.setFips(1)` then makes *every*
+digest fail with `ERR_OSSL_EVP_UNSUPPORTED`, so it is not a usable simulation). It has to be checked
+in a genuinely FIPS-enabled runtime:
+
+```bash
+# On a FIPS-capable Node/OpenSSL build, with a FIPS provider actually loaded:
+node --enable-fips -e 'require("crypto").getFips()'   # must print 1
+npm test                                              # legacy specs tell you the answer
+```
+
+Expected reading of the result:
+
+- If legacy decryption works under FIPS, the receiver can enable FIPS mode at any point.
+- If it fails, the receiver cannot enable FIPS mode until P4/P5, and the migration order becomes:
+  receiver upgrade → senders migrate → legacy dropped → FIPS mode enabled.
+
+Either way the sender side is FIPS-clean from P3 onwards, since it only ever performs SHA-256 OAEP.
+
+## Rollback
+
+| Situation | Action |
+|---|---|
+| v3 receiver misbehaves, before P3 | Roll the receiver back to 2.x. Safe: no sender is emitting `RSA-OAEP-256` yet. |
+| v3 receiver misbehaves, after P3 | **Do not roll the receiver back** — it would start rejecting every upgraded sender with `no key found`. Fix forward, or roll the *sender* back by pinning Kibana's request-crypto dependency. |
+| A sender needs to revert | Pin request-crypto to 2.x in that Kibana branch; the v3 receiver keeps accepting its legacy tokens indefinitely. |
+
+The rollback window for the receiver therefore closes when the first sender ships v3. Confirm the P2
+gate before letting P3 start.
+
+## Sign-off checklist
+
+- [ ] P0 — v3 published, CI green
+- [ ] P1 — receiver on v3 in production, `onKeyWrap` metric emitting
+- [ ] P2 — soak clean for the agreed window
+- [ ] @elastic/platform-analytics acknowledges the receiver-first ordering and the closed rollback
+      window
+- [ ] FIPS-mode behaviour for legacy tokens determined and recorded above
+- [ ] P3 — Kibana on v3, mixed traffic healthy
+- [ ] P4 — legacy share at zero for the agreed window
+- [ ] P5 — legacy algorithm removed in a major release
