@@ -113,6 +113,34 @@ crypto provider (see below).
 
 ## Local validation
 
+### Emulating P0–P2 before deploying anything
+
+[`migration-harness/`](../migration-harness/README.md) runs phases P0 to P2 on one machine, with the
+old path not simulated: the v3 build comes from `npm pack`, the un-upgraded sender is
+`@elastic/request-crypto@2.0.4` from the npm registry, and bodies travel over real HTTP.
+
+```bash
+cd migration-harness
+npm run harness          # P0 + P1 + P2
+npm run soak             # five-minute P2
+node run.mjs --keys /path/to/your/keys --phase p1   # against your own key material
+```
+
+Measured here (M-series laptop, Node 22.22), as a baseline to compare your own run against:
+
+| Soak | Requests | Failures | Peak RSS | `RSA-OAEP` p50 | `RSA-OAEP-256` p50 |
+|---|---|---|---|---|---|
+| 20 s | 27,903 | 0 | 119.2 MB | 2.76 ms | 2.86 ms |
+| 90 s | 128,543 | 0 | 119.5 MB | 2.71 ms | 2.81 ms |
+
+4.6× the traffic left peak memory unchanged, and SHA-256 costs roughly 0.1 ms (~4%) per request on a
+~12 KB body. The harness also confirmed that Kibana's **real published** `kibana1` / `kibana_dev1`
+public keys — stamped `alg: "RSA-OAEP"` — wrap with `RSA-OAEP-256` untouched, and that `onKeyWrap`
+reports exactly the mix the tokens carried on the wire at volume, which is the property the P2 and
+P4 gates depend on.
+
+### The unit suite
+
 The automated suite covers the matrix above:
 
 ```bash

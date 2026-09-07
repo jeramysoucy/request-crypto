@@ -7,3 +7,4 @@ docs
 .nycrc
 tsconfig.json
 tslint.json
+migration-harness
