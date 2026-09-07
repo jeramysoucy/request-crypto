@@ -128,9 +128,17 @@ What proves what:
 |---|---|
 | `test/key-wrap.spec.ts` → *encryption side* | encrypt emits `RSA-OAEP-256` even from a JWK stamped `alg: "RSA-OAEP"` (the production shape) |
 | `test/key-wrap.spec.ts` → *decryption side* | frozen node-jose vectors for **both** algorithms decrypt; an end-to-end legacy sender simulation decrypts; both algorithms interleaved and concurrent on one manager |
+| `test/key-wrap.spec.ts` → *the JWK's own alg member* | a key stamped `alg: "RSA-OAEP-256"` still reads legacy tokens; a JWKS with no `alg` member reads both; one JWKS serves a different algorithm per `kid`, on distinct key material |
+| `test/key-wrap.spec.ts` → *legacy requests through the full request path* | legacy metadata through `getJWKMetadata`; a large legacy payload round trips |
 | `test/key-wrap.spec.ts` → *pinned algorithms* | an out-of-allowlist `alg`/`enc` is rejected; a compression bomb is rejected at the inflate ceiling |
 | `test/key-wrap.spec.ts` → *onKeyWrap* | the rollout metric reports the right algorithm and cannot break a request |
 | `test/compat.spec.ts` | the rest of the wire format is still byte-identical to node-jose output |
+
+Note what the suite deliberately does **not** cover: that a 2.x receiver rejects `RSA-OAEP-256`.
+That is a property of node-jose, not of this package, so asserting it in CI would mean re-adding the
+dependency to test someone else's library. The reproducible evidence lives in the section above
+instead. The half of the constraint that *is* ours — that this version never emits the legacy
+algorithm — is asserted.
 
 ### Regenerating the frozen vectors
 
