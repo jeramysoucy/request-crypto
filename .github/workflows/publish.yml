@@ -18,6 +18,29 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - run: npm install -g npm@latest
       - run: npm install
-      - run: npm publish
+
+      - name: Verify package version matches the release tag
+        run: |
+          version=$(npm pkg get version | tr -d '"')
+          tag="${{ github.event.release.tag_name }}"
+          if [ "v$version" != "$tag" ]; then
+            echo "::error::release tag $tag does not match package.json version $version"
+            exit 1
+          fi
+
+      # Prerelease versions must not take over the `latest` dist-tag: a bare `npm publish`
+      # uses `latest` regardless of the semver prerelease component.
+      - name: Resolve npm dist-tag
+        id: dist
+        run: |
+          version=$(npm pkg get version | tr -d '"')
+          case "$version" in
+            *-*) tag=next ;;
+            *)   tag=latest ;;
+          esac
+          echo "publishing $version under dist-tag $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - run: npm publish --tag ${{ steps.dist.outputs.tag }}
         env:
           NPM_CONFIG_PROVENANCE: true
