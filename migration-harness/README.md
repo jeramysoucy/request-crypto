@@ -44,7 +44,7 @@ reproduced without touching a real key.
 - the tarball excludes `test/`, `docs/`, `migration-harness/` and includes `lib/index.js`, `lib/index.d.ts`
 - the package version has had its major bump (see *Expected failure* below)
 - a body produced by the real 2.0.4 decrypts through the packed artifact, and the hook reports `legacy: true`
-- ESM `import` and CommonJS `require`/`await import` both work, on every Node the machine has at or above the `engines` floor — `zip:DEF` needs `DecompressionStream` (Node 20.12) and `require(esm)` lands at 20.19 / 22.12
+- ESM `import` and CommonJS `require`/`await import` both work, on the current Node plus the lowest and highest installed versions at or above the `engines` floor. The floor matters because `zip:DEF` needs `DecompressionStream` (Node 20.12) and `require(esm)` lands at 20.19 / 22.12; the ceiling matters because Kibana runs Node 24 (`.node-version`). Locally that means 20.19.4, 22.22.0 and 24.19.0 — all green.
 - the shipped `.d.ts` types `DecryptorOptions`, `KeyWrapInfo` and the algorithm constants under NodeNext
 - Kibana's **real published** `kibana1` / `kibana_dev1` public keys wrap with `RSA-OAEP-256` (encryption only — the private halves belong to @elastic/platform-analytics)
 
@@ -108,10 +108,11 @@ The `kid`s are read from the JWKS, so nothing else needs changing.
 
 ## Expected failure
 
-`version is bumped for a breaking release` fails until the release commit bumps `package.json` past
-`3.0.0`. That is deliberate — the harness treats P0 as *the artifact that would be published*, and
-publishing this as `2.0.x` would hand an ESM-only package with a changed key wrap to consumers
-expecting a patch.
+`version is bumped for a breaking release` fails until `package.json` is bumped to a `3.x` version
+(`3.0.0-alpha.1` counts). That is deliberate — the harness treats P0 as *the artifact that would be
+published*, and publishing this as `2.0.x` would hand an ESM-only package with a changed key wrap to
+consumers expecting a patch. Run the harness before **each** publish, alpha and GA: it is the gate on
+P0.1 and P0.4 in the migration doc.
 
 ## What this cannot tell you
 

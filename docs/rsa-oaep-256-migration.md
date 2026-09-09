@@ -52,12 +52,99 @@ before any sender starts emitting `RSA-OAEP-256`.**
 
 Each phase has an exit gate. Do not start a phase before the previous gate is green.
 
-### P0 — publish
+### P0 — publish an alpha, prove it, then publish 3.0.0
 
-Release request-crypto v3 with this change. No traffic is affected: publishing does not upgrade
-anybody.
+Nothing here changes any traffic: publishing does not upgrade anybody. The point of the alpha is to
+put the real artifact through Kibana's CI (including FIPS) and through a live receiver in a dev
+environment, so that the GA release is a formality rather than a leap.
 
-*Gate:* package published; `npm test` green in CI.
+Prerequisite: [#59](https://github.com/elastic/request-crypto/pull/59) must be merged first — it
+teaches the publish workflow to handle prerelease versions. A bare `npm publish` uses the `latest`
+dist-tag regardless of the semver prerelease component, so without it an alpha would be handed to
+everyone running `npm install @elastic/request-crypto`.
+
+#### P0.1 — publish `3.0.0-alpha.1`
+
+Run the harness first (`cd migration-harness && npm run harness`); its *version is bumped for a
+breaking release* check exists precisely to gate this step. Then follow the release process in the
+README: bump `version` in a PR against `main`, tag the merge commit `v3.0.0-alpha.1`, and publish a
+GitHub release for that tag with **Set as a pre-release** checked.
+
+The workflow derives the dist-tag from the version: anything containing a `-` publishes under
+**`next`**, so `latest` keeps pointing at 2.0.4 and nobody picks the alpha up by accident.
+
+*Gate:* `npm view @elastic/request-crypto dist-tags` shows `next: 3.0.0-alpha.1` with `latest`
+unchanged, and the published tarball carries provenance.
+
+#### P0.2 — alpha in Kibana's CI, including FIPS
+
+Open a **draft** PR against `elastic/kibana` bumping `"@elastic/request-crypto"` in
+[`package.json`](https://github.com/elastic/kibana/blob/main/package.json) from `2.0.4` to
+`3.0.0-alpha.1` (pin the exact version, as Kibana already does) and refreshing `yarn.lock`. Kibana
+is a sender and only ever encrypts, so the blast radius is one plugin:
+`src/platform/plugins/shared/telemetry_collection_manager/server/encryption/`.
+
+```bash
+# from a Kibana checkout, on a branch
+yarn add --exact @elastic/request-crypto@3.0.0-alpha.1
+GH_PAGER=cat gh pr create --draft -R elastic/kibana \
+  --title 'Bump @elastic/request-crypto to 3.0.0-alpha.1 (RSA-OAEP-256 key wrap)' \
+  --body '…'
+GH_PAGER=cat gh pr edit <number> -R elastic/kibana \
+  --add-label 'ci:enable-fips-140-3-agent' --add-label 'ci:build-docker-fips'
+GH_PAGER=cat gh pr checks <number> -R elastic/kibana
+```
+
+How FIPS actually gets exercised, since this is easy to get wrong:
+
+- **`ci:enable-fips-140-3-agent`** is the one that matters. `getAgentImageConfig` swaps the agents
+  for FIPS images when any FIPS label is present (`.buildkite/pipeline-utils/agent_images.ts`), and
+  the label also sets `TEST_ENABLE_FIPS_VERSION=140-3`, so **the normal suites run under FIPS** and
+  a `Verify FIPS Enabled` step is added. Buildkite annotates the build with a warning that FIPS mode
+  can produce new test failures — expect to have to separate pre-existing FIPS flakes from anything
+  this bump caused.
+- **`ci:build-docker-fips`** additionally builds a FIPS image, but that step is `soft_fail: true`:
+  it will not fail the build. Read its result, do not infer it from a green tick.
+- The nightly `kibana-fips` pipeline (buildkite.com/elastic/kibana-fips, notifying `#kibana-fips`)
+  runs against `main`, so it only covers this after merge. Use the labels to get the signal *before*.
+
+Two specific things to watch, because they are where an ESM-only package bites a CJS host:
+
+- Kibana runs Node `24.19.0` (`.node-version`), comfortably above this package's `>=20.12` floor.
+  The harness covers 20.19, 22.x and 24.19 for both `import` and `require`.
+- `encrypt.test.mocks.ts` replaces the package wholesale with `jest.doMock`, so Kibana's unit tests
+  never load the real ESM module. That is why the suite passing is *not* evidence the import works —
+  the FIPS/functional runs and a real Kibana boot are.
+
+*Gate:* CI green with the FIPS agent label (or every failure traced to a pre-existing FIPS issue);
+telemetry encryption verified end to end in a running Kibana; the PR stays a draft — it is a probe,
+not a change we intend to merge yet.
+
+#### P0.3 — alpha on the dev receiver
+
+@elastic/platform-analytics upgrades the receiving side to `3.0.0-alpha.1` in the **dev environment
+only**, and confirms it still decrypts traffic from un-upgraded senders — which is all real traffic,
+since no sender has switched. Wire `onKeyWrap` at the same time; dev is where you find out whether
+the metric lands in your dashboards, not production.
+
+The harness can be pointed at real key material first, so this is not the first time the alpha meets
+those keys:
+
+```bash
+cd migration-harness
+node run.mjs --keys /path/to/your/keys --phase p1   # private.json + sender-jwks.json
+```
+
+*Gate:* dev receiver on the alpha; legacy `RSA-OAEP` traffic decrypting with no error-rate change;
+`onKeyWrap` reporting ~100% legacy; a dev Kibana built from the P0.2 branch producing
+`RSA-OAEP-256` traffic that dev decrypts, giving one confirmed mixed-traffic sample.
+
+#### P0.4 — publish `3.0.0`
+
+Bump to `3.0.0`, tag, release without the pre-release box — the workflow publishes it under
+`latest`. Nothing is deployed by this; it just makes the version installable.
+
+*Gate:* P0.2 and P0.3 green; `latest: 3.0.0`.
 
 ### P1 — receiver upgrades (decrypt-capable, no traffic change)
 
@@ -285,6 +372,13 @@ node --enable-fips -e 'require("crypto").getFips()'   # must print 1
 npm test                                              # legacy specs tell you the answer
 ```
 
+**What P0.2 does and does not settle.** Kibana's FIPS CI answers the *sender* question — whether
+`RSA-OAEP-256` encryption works under a FIPS provider — and that is the half that has to work for
+Kibana to run FIPS-enabled at all. It says nothing about the receiver decrypting legacy `RSA-OAEP`
+under FIPS, because Kibana never decrypts. Answering the receiver half needs either the command
+above in a FIPS runtime, or a FIPS-enabled dev receiver at P0.3; if platform-analytics' dev
+environment is not FIPS-enabled, this question stays open and the conservative reading below applies.
+
 Expected reading of the result:
 
 - If legacy decryption works under FIPS, the receiver can enable FIPS mode at any point.
@@ -293,6 +387,10 @@ Expected reading of the result:
 
 Either way the sender side is FIPS-clean from P3 onwards, since it only ever performs SHA-256 OAEP.
 
+If the FIPS suites fail on the P0.2 PR, triage them with the `/debug-fips-failure` skill rather than
+by eye — most red in that pipeline is pre-existing FIPS flake, and the skill's job is separating
+that from a real regression.
+
 ## Rollback
 
 | Situation | Action |
@@ -300,13 +398,18 @@ Either way the sender side is FIPS-clean from P3 onwards, since it only ever per
 | v3 receiver misbehaves, before P3 | Roll the receiver back to 2.x. Safe: no sender is emitting `RSA-OAEP-256` yet. |
 | v3 receiver misbehaves, after P3 | **Do not roll the receiver back** — it would start rejecting every upgraded sender with `no key found`. Fix forward, or roll the *sender* back by pinning Kibana's request-crypto dependency. |
 | A sender needs to revert | Pin request-crypto to 2.x in that Kibana branch; the v3 receiver keeps accepting its legacy tokens indefinitely. |
+| The alpha misbehaves anywhere in P0 | Close the draft Kibana PR, roll the dev receiver back to 2.0.4, fix, publish `3.0.0-alpha.2`. Nothing is at stake: the alpha only ever lived on the `next` dist-tag, in one draft PR and one dev environment. |
 
 The rollback window for the receiver therefore closes when the first sender ships v3. Confirm the P2
 gate before letting P3 start.
 
 ## Sign-off checklist
 
-- [ ] P0 — v3 published, CI green
+- [ ] #59 merged, so prereleases publish under `next` instead of `latest`
+- [ ] P0.1 — `3.0.0-alpha.1` published, `latest` still on 2.0.4
+- [ ] P0.2 — draft Kibana PR bumped to the alpha, CI green with `ci:enable-fips-140-3-agent`
+- [ ] P0.3 — dev receiver on the alpha, legacy traffic decrypting, `onKeyWrap` visible in dashboards
+- [ ] P0.4 — `3.0.0` published under `latest`
 - [ ] P1 — receiver on v3 in production, `onKeyWrap` metric emitting
 - [ ] P2 — soak clean for the agreed window
 - [ ] @elastic/platform-analytics acknowledges the receiver-first ordering and the closed rollback
