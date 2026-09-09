@@ -158,6 +158,32 @@ async function handler (event, context, callback) {
 
 If the key is not in the provided JWKS the function will throw an error `Error: no key found`.
 
+## Releasing
+
+Versions and tags are created by hand; CI only publishes.
+
+1. Bump `version` in `package.json` in a PR against `main`. The `Prepare Package` workflow runs
+   lint, build and tests across the supported Node versions on the PR — that is the gate.
+2. Tag the merge commit `v<version>` (annotated) and push the tag. The tag must match
+   `package.json` exactly; the publish job fails fast if it does not.
+3. Publish a GitHub release for that tag. Check **Set as a pre-release** when the version has a
+   prerelease suffix.
+
+The `Publish Package to npmjs` workflow then publishes to npm with
+[provenance](https://docs.npmjs.com/generating-provenance-statements), authenticating with
+[trusted publishing](https://docs.npmjs.com/trusted-publishers) — there is no token to rotate.
+The dist-tag is derived from the version: prerelease versions (anything containing a `-`, e.g.
+`3.0.0-alpha.1`) publish under **`next`**, everything else under **`latest`**. Install a
+prerelease with:
+
+```sh
+npm install @elastic/request-crypto@next
+```
+
+Note that the npm trusted publisher is bound to this repository *and* to the
+`.github/workflows/publish.yml` filename, so adding a separate publish workflow will fail
+authentication until the npm-side configuration is updated.
+
 ### RFCs followed for implementation details
 
 - JWK RFC: https://tools.ietf.org/html/rfc7517
