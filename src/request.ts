@@ -44,10 +44,10 @@ export interface DecryptorOptions {
    * wire this to a counter to watch legacy "RSA-OAEP" traffic drain away as senders upgrade — that
    * measurement is what tells you when legacy support can safely be dropped, and when the receiver
    * can run under a FIPS-only crypto provider. It fires for both algorithms so the ratio is
-   * available, not just the legacy count. Exceptions thrown here are swallowed, so instrumentation
-   * can never fail a request. See docs/rsa-oaep-256-migration.md.
+   * available, not just the legacy count. A throw or a rejected promise from this callback is
+   * swallowed, so instrumentation can never fail a request. See docs/rsa-oaep-256-migration.md.
    */
-  onKeyWrap?(info: KeyWrapInfo): void;
+  onKeyWrap?(info: KeyWrapInfo): void | Promise<void>;
 }
 
 export async function createRequestEncryptor(publicJWKS: PublicJWKS): Promise<Encryptor> {
@@ -73,10 +73,15 @@ export async function createRequestDecryptor(
       return;
     }
     try {
-      options.onKeyWrap({
+      const result = options.onKeyWrap({
         kid: header.kid,
         alg: header.alg,
         legacy: header.alg === LEGACY_KEY_WRAP_ALGORITHM,
+      });
+      // Attach the rejection handler before returning. An async hook's promise otherwise becomes
+      // an unhandled rejection, which Node reports as an uncaught exception.
+      Promise.resolve(result).catch(() => {
+        // Instrumentation must never break decryption.
       });
     } catch (err) {
       // Instrumentation must never break decryption.

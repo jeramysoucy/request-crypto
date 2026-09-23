@@ -317,6 +317,29 @@ describe('Key wrap algorithm — RSA-OAEP-256 out, RSA-OAEP or RSA-OAEP-256 in',
       expect(await decryptor.decrypt(body)).to.eql(smallPayload);
     });
 
+    it('does not fail a request when an async hook rejects', async () => {
+      const unhandled: Array<unknown> = [];
+      const onUnhandled = (reason: unknown) => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        const encryptor = await createRequestEncryptor(publicJWKS);
+        const decryptor = await createRequestDecryptor(privateJWKS, {
+          onKeyWrap: async () => {
+            throw new Error('metrics backend is down');
+          },
+        });
+
+        const body = await encryptor.encrypt('KIBANA', smallPayload);
+        expect(await decryptor.decrypt(body)).to.eql(smallPayload);
+        await new Promise(resolve => setImmediate(resolve));
+        expect(unhandled).to.eql([]);
+      } finally {
+        process.removeListener('unhandledRejection', onUnhandled);
+      }
+    });
+
     it('is optional — decryption works with no options at all', async () => {
       const encryptor = await createRequestEncryptor(publicJWKS);
       const decryptor = await createRequestDecryptor(privateJWKS);

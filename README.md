@@ -190,8 +190,8 @@ imported for whichever algorithm is required — so public keys already publishe
 
 `createRequestDecryptor` takes an optional `onKeyWrap` callback that reports which key wrap
 algorithm each request actually used. Receivers can use it to tell when senders have finished
-migrating off the legacy algorithm. Exceptions thrown by the callback are swallowed, so
-instrumentation can never fail a request.
+migrating off the legacy algorithm. A throw or a rejected promise from the callback is
+swallowed, so instrumentation can never fail a request.
 
 ```js
 const requestDecryptor = await createRequestDecryptor(privateJWKS, {
