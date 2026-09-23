@@ -1,8 +1,10 @@
 # Migrating the key wrap algorithm to RSA-OAEP-256
 
 Status: proposed, tracked by [#56](https://github.com/elastic/request-crypto/pull/56).
-Sender: Kibana (`telemetry_collection_manager`). Receiver: the telemetry service, owned by
-@elastic/platform-analytics.
+Sender: Kibana (`telemetry_collection_manager`). Receiver:
+[`aqueduct/decrypt`](https://github.com/elastic/telemetry/blob/main/aqueduct/decrypt/package.json)
+in `elastic/telemetry`, owned by @elastic/platform-analytics. The receiver bump is tracked in
+[elastic/telemetry#7527](https://github.com/elastic/telemetry/issues/7527).
 
 This document covers the *key wrap* migration only. Everything else about the token — content
 encryption, compression, serialization, the packed body — is unchanged.
@@ -55,13 +57,13 @@ Each phase has an exit gate. Do not start a phase before the previous gate is gr
 ### P0 — publish an alpha, prove it, then publish 3.0.0
 
 Nothing here changes any traffic: publishing does not upgrade anybody. The point of the alpha is to
-put the real artifact through Kibana's CI (including FIPS) and through a live receiver in a dev
-environment, so that the GA release is a formality rather than a leap.
+put the real artifact through Kibana's CI (including FIPS) and through the staging receiver, so
+that the GA release is a formality rather than a leap.
 
-Prerequisite: [#59](https://github.com/elastic/request-crypto/pull/59) must be merged first — it
-teaches the publish workflow to handle prerelease versions. A bare `npm publish` uses the `latest`
-dist-tag regardless of the semver prerelease component, so without it an alpha would be handed to
-everyone running `npm install @elastic/request-crypto`.
+[#59](https://github.com/elastic/request-crypto/pull/59) is merged, and this branch includes it, so
+the publish workflow derives the dist-tag from the version. A bare `npm publish` uses the `latest`
+dist-tag regardless of the semver prerelease component; the workflow is what keeps an alpha off
+`latest`.
 
 #### P0.1 — publish `3.0.0-alpha.1`
 
@@ -120,12 +122,20 @@ Two specific things to watch, because they are where an ESM-only package bites a
 telemetry encryption verified end to end in a running Kibana; the PR stays a draft — it is a probe,
 not a change we intend to merge yet.
 
-#### P0.3 — alpha on the dev receiver
+#### P0.3 — alpha on the staging receiver
 
-@elastic/platform-analytics upgrades the receiving side to `3.0.0-alpha.1` in the **dev environment
-only**, and confirms it still decrypts traffic from un-upgraded senders — which is all real traffic,
-since no sender has switched. Wire `onKeyWrap` at the same time; dev is where you find out whether
-the metric lands in your dashboards, not production.
+Staging is where the alpha meets a live receiver. The bump of
+[`aqueduct/decrypt`](https://github.com/elastic/telemetry/blob/main/aqueduct/decrypt/package.json)
+to `3.0.0-alpha.1` is tracked in
+[elastic/telemetry#7527](https://github.com/elastic/telemetry/issues/7527). Once the alpha is
+published, that service is upgraded on staging.
+
+The first measure, before that deploy, is tests in `aqueduct/decrypt` for a legacy body and a
+new-format body. Those tests live in that service.
+
+Staging then receives both kinds of body: legacy `RSA-OAEP`, which is everything real senders
+still emit, and `RSA-OAEP-256` bodies sent at it on purpose. `onKeyWrap` should report that mix.
+Wire the hook here; staging is where you find out whether the metric lands, not production.
 
 The harness can be pointed at real key material first, so this is not the first time the alpha meets
 those keys:
@@ -135,9 +145,8 @@ cd migration-harness
 node run.mjs --keys /path/to/your/keys --phase p1   # private.json + sender-jwks.json
 ```
 
-*Gate:* dev receiver on the alpha; legacy `RSA-OAEP` traffic decrypting with no error-rate change;
-`onKeyWrap` reporting ~100% legacy; a dev Kibana built from the P0.2 branch producing
-`RSA-OAEP-256` traffic that dev decrypts, giving one confirmed mixed-traffic sample.
+*Gate:* staging `aqueduct/decrypt` on the alpha; both formats decrypt; the events land in the stack
+telemetry index and the BigQuery view; `onKeyWrap` reports the mix that was sent.
 
 #### P0.4 — publish `3.0.0`
 
@@ -146,11 +155,12 @@ Bump to `3.0.0`, tag, release without the pre-release box — the workflow publi
 
 *Gate:* P0.2 and P0.3 green; `latest: 3.0.0`.
 
-### P1 — receiver upgrades (decrypt-capable, no traffic change)
+### P1 — production receiver (decrypt-capable, fleet traffic unchanged)
 
-The telemetry service bumps to v3. All inbound traffic is still `RSA-OAEP`, and stays working: the
-receiver now accepts both algorithms and picks per token. While upgrading, wire the `onKeyWrap` hook
-to a counter — this is the instrument the rest of the rollout is steered by:
+Production `aqueduct/decrypt` bumps to `3.0.0`. Staging already proved the alpha. Fleet traffic is
+still `RSA-OAEP`, and stays working: the receiver accepts both algorithms and picks per token.
+While upgrading, wire the `onKeyWrap` hook to a counter — this is the instrument the rest of the
+rollout is steered by:
 
 ```ts
 const decryptor = await createRequestDecryptor(privateJWKS, {
@@ -160,8 +170,13 @@ const decryptor = await createRequestDecryptor(privateJWKS, {
 });
 ```
 
-*Gate:* deployed to staging then production; decrypt error rate flat; the counter reports ~100%
-`RSA-OAEP` and zero `RSA-OAEP-256`.
+After the production deploy, and before any Kibana sender switches, send one `RSA-OAEP-256` sample
+from a local machine. That sample must decrypt, show up on the counter, and land in the stack
+telemetry index and the BigQuery view.
+
+*Gate:* production `aqueduct/decrypt` on `3.0.0`; fleet decrypt error rate flat; the counter shows
+fleet traffic still on `RSA-OAEP`; the controlled `RSA-OAEP-256` sample is visible in the counter,
+the stack telemetry index, and BigQuery.
 
 ### P2 — soak the receiver
 
@@ -195,6 +210,10 @@ Remove `LEGACY_KEY_WRAP_ALGORITHM` from `SUPPORTED_KEY_WRAP_ALGORITHMS` in `src/
 one-line change, deliberately isolated there — and release it as a major. Only after this is the
 receiver free of SHA-1 on this path, which is also the precondition for running it under a FIPS-only
 crypto provider (see below).
+
+One `aqueduct/decrypt` process covers both algorithms, which is why the rollout is a version bump
+of that service. A second decrypt service is the fallback for a later decision to reject legacy
+tokens while still accepting events from clusters that have not upgraded.
 
 *Gate:* P4 gate held for the agreed window; @elastic/platform-analytics sign-off.
 
@@ -339,11 +358,13 @@ Feed the bodies across the four combinations. Verified outcomes:
 
 ## Cloud / staging validation
 
-1. **Replay legacy traffic.** Deploy the v3 receiver to staging and replay captured `RSA-OAEP`
-   bodies. Every one must decrypt, and the `onKeyWrap` counter must report `legacy: true`.
-2. **Drive the new algorithm from a real sender.** Point a dev Kibana build (v3 dependency) at
-   staging using `kibana_dev1`. Confirm the telemetry documents land and the counter reports both
-   algorithms side by side.
+1. **Replay legacy traffic.** Staging `aqueduct/decrypt` on the alpha replays captured `RSA-OAEP`
+   bodies. Every one must decrypt, the `onKeyWrap` counter must report `legacy: true`, and the
+   events must land in the stack telemetry index and the BigQuery view.
+2. **Drive the new algorithm at staging.** Send `RSA-OAEP-256` bodies at the same staging receiver.
+   A dev Kibana build (v3 dependency) pointed at staging with `kibana_dev1` is one way to produce
+   them. Confirm those documents land in the same index and BigQuery view, and that the counter
+   reports both algorithms side by side.
 3. **Watch the failure modes explicitly.** Alert on decrypt failure rate, `no key found`, and
    `ERR_JOSE_ALG_NOT_ALLOWED`. The first is what a premature sender switch would look like on an
    un-upgraded receiver; the last is what a genuinely unexpected algorithm looks like.
@@ -376,8 +397,12 @@ npm test                                              # legacy specs tell you th
 `RSA-OAEP-256` encryption works under a FIPS provider — and that is the half that has to work for
 Kibana to run FIPS-enabled at all. It says nothing about the receiver decrypting legacy `RSA-OAEP`
 under FIPS, because Kibana never decrypts. Answering the receiver half needs either the command
-above in a FIPS runtime, or a FIPS-enabled dev receiver at P0.3; if platform-analytics' dev
-environment is not FIPS-enabled, this question stays open and the conservative reading below applies.
+above in a FIPS runtime, or a FIPS-enabled staging receiver at P0.3. If staging is not
+FIPS-enabled, this question stays open.
+
+The case for keeping SHA-1 on the receiver is that this path is decrypt-only. That case is what
+would carry the receiver through 2030, and decrypt-only exemptions often continue past a cutoff.
+It has not been granted. Until it is, the reading below applies.
 
 Expected reading of the result:
 
@@ -398,19 +423,19 @@ that from a real regression.
 | v3 receiver misbehaves, before P3 | Roll the receiver back to 2.x. Safe: no sender is emitting `RSA-OAEP-256` yet. |
 | v3 receiver misbehaves, after P3 | **Do not roll the receiver back** — it would start rejecting every upgraded sender with `no key found`. Fix forward, or roll the *sender* back by pinning Kibana's request-crypto dependency. |
 | A sender needs to revert | Pin request-crypto to 2.x in that Kibana branch; the v3 receiver keeps accepting its legacy tokens indefinitely. |
-| The alpha misbehaves anywhere in P0 | Close the draft Kibana PR, roll the dev receiver back to 2.0.4, fix, publish `3.0.0-alpha.2`. Nothing is at stake: the alpha only ever lived on the `next` dist-tag, in one draft PR and one dev environment. |
+| The alpha misbehaves anywhere in P0 | Close the draft Kibana PR, roll staging `aqueduct/decrypt` back to 2.0.4, fix, publish `3.0.0-alpha.2`. Nothing is at stake: the alpha only ever lived on the `next` dist-tag, in one draft Kibana PR and on staging. |
 
 The rollback window for the receiver therefore closes when the first sender ships v3. Confirm the P2
 gate before letting P3 start.
 
 ## Sign-off checklist
 
-- [ ] #59 merged, so prereleases publish under `next` instead of `latest`
+- [x] #59 merged, so prereleases publish under `next` instead of `latest`
 - [ ] P0.1 — `3.0.0-alpha.1` published, `latest` still on 2.0.4
 - [ ] P0.2 — draft Kibana PR bumped to the alpha, CI green with `ci:enable-fips-140-3-agent`
-- [ ] P0.3 — dev receiver on the alpha, legacy traffic decrypting, `onKeyWrap` visible in dashboards
+- [ ] P0.3 — staging `aqueduct/decrypt` on the alpha; old and new bodies decrypt and land in the stack telemetry index and BigQuery; `onKeyWrap` shows that mix
 - [ ] P0.4 — `3.0.0` published under `latest`
-- [ ] P1 — receiver on v3 in production, `onKeyWrap` metric emitting
+- [ ] P1 — production `aqueduct/decrypt` on `3.0.0`; fleet traffic still legacy; the controlled `RSA-OAEP-256` sample visible in the counter, the stack telemetry index, and BigQuery
 - [ ] P2 — soak clean for the agreed window
 - [ ] @elastic/platform-analytics acknowledges the receiver-first ordering and the closed rollback
       window
